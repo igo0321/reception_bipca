@@ -59,6 +59,16 @@ def get_active_form_items():
 def clear_all_cache():
     st.cache_data.clear()
 
+# --- ユーティリティ関数 ---
+
+def delete_all_records(table_obj):
+    """指定テーブルの全レコードを削除する（バッチ処理）"""
+    all_records = table_obj.all()
+    all_ids = [r['id'] for r in all_records]
+    # 10件ずつバッチ削除（pyairtableのbatch_deleteは自動でチャンク処理してくれるが念のため）
+    if all_ids:
+        table_obj.batch_delete(all_ids)
+
 # --- Config関連関数 ---
 
 def get_config_value(key):
@@ -409,28 +419,48 @@ def page_admin():
                         clear_all_cache()
                         st.rerun()
 
-    # Tab 2: セレクターB設定
+    # Tab 2: セレクターB設定 (一括編集機能へ変更)
     with tab2:
         st.subheader(f"{label_b} の管理 (データのみ)")
-        with st.expander("➕ 新規追加"):
-            with st.form("add_b"):
-                d_name = st.text_input("名称")
-                d_order = st.number_input("表示順", value=1)
-                if st.form_submit_button("追加") and d_name:
-                    tbl_departments.create({"Name": d_name, "Order": d_order, "Active": True})
-                    clear_all_cache()
-                    st.rerun()
+        st.info("※テキストエリアで一括編集・並び替えができます。上から順に表示されます。")
         
-        data_b = get_selector_b_options()
-        for d in data_b:
-             with st.container(border=True):
-                c1, c2, c3 = st.columns([1, 4, 1])
-                c1.write(f"順:{d['fields'].get('Order')}")
-                c2.write(f"**{d['fields'].get('Name')}**")
-                if c3.button("削除", key=f"del_b_{d['id']}"):
-                    tbl_departments.delete(d['id'])
+        # 現在のデータを取得
+        current_data = get_selector_b_options()
+        current_names = [d['fields'].get('Name') for d in current_data if d['fields'].get('Name')]
+        
+        # テキストエリア用文字列作成
+        default_text = "\n".join(current_names)
+        
+        with st.form("batch_edit_b"):
+            updated_text = st.text_area(
+                "項目一覧（1行1項目）",
+                value=default_text,
+                height=300,
+                help="項目を追加、削除、並び替えする場合はここで編集して保存してください。"
+            )
+            
+            if st.form_submit_button("保存して更新する"):
+                # 入力テキストをリスト化（空行除去）
+                new_names = [line.strip() for line in updated_text.split('\n') if line.strip()]
+                
+                with st.spinner("更新中..."):
+                    # 1. 既存データを全削除（IDが変わるがデータ用項目なので許容）
+                    old_ids = [d['id'] for d in current_data]
+                    if old_ids:
+                        tbl_departments.batch_delete(old_ids)
+                    
+                    # 2. 新しい順序で作成
+                    records_to_create = []
+                    for i, name in enumerate(new_names):
+                        # pyairtableのbatch_create用に辞書を作成してもよいが、単純なループで作成
+                        # (件数が数百件でなければcreate連打でも許容範囲だが、念のためbatch推奨だがここではシンプルにcreate)
+                        tbl_departments.create({"Name": name, "Order": i + 1, "Active": True})
+                    
                     clear_all_cache()
-                    st.rerun()
+                
+                st.success(f"{len(new_names)}件の項目を更新しました。")
+                time.sleep(1)
+                st.rerun()
 
     # Tab 3: 入力項目
     with tab3:
@@ -460,7 +490,7 @@ def page_admin():
                     clear_all_cache()
                     st.rerun()
 
-    # Tab 4: スタッフ管理 (機能改善箇所)
+    # Tab 4: スタッフ管理
     with tab4:
         st.subheader("スタッフ管理")
         st.caption(f"各スタッフの紐づき状況: {label_a}")
@@ -495,7 +525,7 @@ def page_admin():
             csv = df.to_csv(index=False).encode('utf-8-sig')
             st.download_button("CSV DL (Excel対応版)", csv, "data.csv", "text/csv")
 
-    # Tab 6: 全体設定
+    # Tab 6: 全体設定 & リセット
     with tab6:
         st.subheader("全体設定・名称変更")
         with st.form("global_config"):
@@ -530,6 +560,41 @@ def page_admin():
                 st.success("設定を更新しました。")
                 time.sleep(1)
                 st.rerun()
+
+       # --- システム初期化セクション（完全リセット版） ---
+        st.divider()
+        st.markdown("### ⚠️ システム初期化・リセット")
+        st.warning("【注意】この操作を行うと、受付データだけでなく、**設定した「セレクターの中身」「質問項目」「画面の名称設定」など、すべてのデータ**が完全に削除され、初期状態に戻ります。")
+        
+        with st.expander("初期化メニューを開く"):
+            confirm_reset = st.checkbox("すべてのデータを削除し、初期化することを承認します")
+            if confirm_reset:
+                if st.button("完全初期化を実行する", type="primary"):
+                    with st.spinner("全データを削除・初期化中..."):
+                        # 1. ユーザーデータ（個人情報）の削除
+                        delete_all_records(tbl_submissions)
+                        delete_all_records(tbl_staff)
+                        
+                        # 2. 設定データ（セレクター・質問）の削除
+                        delete_all_records(tbl_venues)      # セレクター①の中身
+                        delete_all_records(tbl_departments) # セレクター②の中身
+                        delete_all_records(tbl_form_items)  # 質問項目
+                        
+                        # 3. Config（タイトルやラベル名など）の全削除
+                        delete_all_records(tbl_config)
+                        
+                        # 4. 指定パスワードで設定を再作成
+                        # （Configを全消去したため、パスワードレコードを新規作成します）
+                        reset_pw = "iqqoo32i"
+                        tbl_config.create({"Key": "admin_password", "Value": reset_pw})
+                        tbl_config.create({"Key": "staff_password", "Value": reset_pw})
+                        
+                        # ※その他の設定（タイトル等）はレコードがなければデフォルト値が使われます
+                        
+                        clear_all_cache()
+                        
+                    st.success("システムを完全に初期化しました。")
+                    st.info(f"管理者・スタッフ用パスワードは **{reset_pw}** に設定されました。")
 
 def main():
     st.sidebar.title("メニュー")
