@@ -68,7 +68,6 @@ def get_config_value(key):
     return None, None
 
 def update_config_value(key, new_value):
-    # Boolean等は文字列で保存
     if isinstance(new_value, bool):
         new_value = "True" if new_value else "False"
         
@@ -80,17 +79,9 @@ def update_config_value(key, new_value):
 
 def get_app_settings():
     """アプリ全体の表示設定を一括取得"""
-    # 毎回Configを引くと遅いので、ここもキャッシュしたいがConfigは頻繁に変わるため生で取得
-    # あるいはst.session_stateに入れる手もあるが、今回はシンプルに実装
-    
     settings = {}
-    keys = [
-        'page_title', 'admin_email', 
-        'label_selector_a', 'visible_selector_a',
-        'label_selector_b', 'visible_selector_b'
-    ]
     
-    # バッチ取得できないためループ（実運用ではConfigを全件取得してPython側でフィルタ推奨）
+    # Config全件取得
     all_configs = tbl_config.all()
     config_dict = {r['fields']['Key']: r['fields'].get('Value') for r in all_configs}
     
@@ -121,19 +112,19 @@ def send_notification_email(settings, val_a, val_b, name, phone, details_text):
     if not admin_email:
         admin_email = sender_email 
 
-    # スタッフアドレス取得（セレクターAが選択されている場合のみ）
+    # スタッフアドレス取得
     staff_emails = []
     if val_a:
         staff_records = tbl_staff.all(formula=f"{{Assigned_Venue}}='{val_a}'")
         staff_emails = [s['fields'].get('Email') for s in staff_records if 'Email' in s['fields']]
     
+    # 送信先リスト作成（管理者 + スタッフ）
     recipients = list(set([admin_email] + staff_emails))
     recipients = [r for r in recipients if r]
 
     if not recipients:
         return True
 
-    # 件名・本文の構築
     subject_parts = [name]
     if val_a: subject_parts.append(val_a)
     if val_b: subject_parts.append(val_b)
@@ -206,7 +197,6 @@ def page_participant():
 
     # --- 【入力画面】 ---
     
-    # セレクターA（旧会場）の処理
     selected_val_a = None
     active_opts_a = []
     
@@ -218,16 +208,13 @@ def page_participant():
             return
         selected_val_a = st.selectbox(settings['label_a'], active_opts_a)
     
-    # セレクターB（旧部門）の処理
     selected_val_b = None
     if settings['vis_b']:
         data_b = get_selector_b_options()
         opts_b = [d['fields'].get('Name') for d in data_b if d['fields'].get('Name')]
-        if not opts_b:
-             opts_b = ["設定なし"]
+        if not opts_b: opts_b = ["設定なし"]
         selected_val_b = st.selectbox(settings['label_b'], opts_b)
 
-    # 質問項目の取得
     form_items = get_active_form_items()
     st.write("以下のフォームに入力し、受付を行ってください。")
 
@@ -243,14 +230,10 @@ def page_participant():
             f = item['fields']
             condition = f.get('Condition')
             
-            # 条件分岐（セレクターBの値に基づく）
             if condition:
-                # セレクターBが非表示、または未選択の場合は条件付き項目は表示しない安全策
-                if not selected_val_b:
-                    continue
+                if not selected_val_b: continue
                 cond_list = [c.strip() for c in condition.replace('、', ',').split(',')]
-                if selected_val_b not in cond_list:
-                    continue 
+                if selected_val_b not in cond_list: continue 
 
             label = f.get('Label', '無題の質問')
             q_type = f.get('Type', 'text')
@@ -282,7 +265,6 @@ def page_participant():
                 if other_info:
                     details_str += f"\n【その他】: {other_info}"
 
-                # Airtable保存
                 tbl_submissions.create({
                     "Venue": selected_val_a if selected_val_a else "(非表示)",
                     "Department": selected_val_b if selected_val_b else "(非表示)",
@@ -291,13 +273,10 @@ def page_participant():
                     "Other": details_str
                 })
                 
-                # メール送信
                 send_notification_email(settings, selected_val_a, selected_val_b, name, phone, details_str)
                 
-                # 完了画面用のメッセージ取得
                 msg_content = ""
                 if selected_val_a:
-                    # 再度全件取得してマッチング（キャッシュ利用）
                     all_venues = get_selector_a_options()
                     target = next((v for v in all_venues if v['fields'].get('Name') == selected_val_a), None)
                     if target:
@@ -320,7 +299,6 @@ def page_staff_registration():
 
     st.divider()
     
-    # セレクターAの選択肢を取得
     data_a = get_selector_a_options()
     active_opts_a = [v['fields'].get('Name') for v in data_a if v['fields'].get('Active') and v['fields'].get('Name')]
     
@@ -329,7 +307,6 @@ def page_staff_registration():
         return
 
     with st.form("staff_reg_form"):
-        # 名称をConfigから反映
         venue = st.selectbox(f"担当する{settings['label_a']}", active_opts_a)
         s_name = st.text_input("スタッフ氏名")
         s_email = st.text_input("通知先メールアドレス")
@@ -339,27 +316,35 @@ def page_staff_registration():
         if s_name and s_email:
             tbl_staff.create({"Name": s_name, "Email": s_email, "Assigned_Venue": venue})
             
-            # 簡易通知処理
+            # スタッフ登録通知（管理者へもCC）
             try:
                 smtp_server = st.secrets["mail"]["smtp_server"]
                 smtp_port = st.secrets["mail"]["smtp_port"]
                 sender_email = st.secrets["mail"]["sender_email"]
                 sender_password = st.secrets["mail"]["sender_password"]
                 
-                msg = MIMEText(f"{s_name}様\n\n{venue} ({settings['label_a']}) の担当として登録しました。")
-                msg['Subject'] = "スタッフ登録完了"
+                # 設定から管理者メアド取得
+                admin_email = settings['admin_email']
+                if not admin_email: admin_email = sender_email
+
+                # 送信先: 本人 + 管理者
+                recipients = list(set([s_email, admin_email]))
+                
+                msg = MIMEText(f"{s_name}様\n\n{venue} ({settings['label_a']}) の担当として登録しました。\n\n（※本メールは管理者 {admin_email} にも通知されています）")
+                msg['Subject'] = "【システム通知】スタッフ登録完了"
                 msg['From'] = formataddr((settings['page_title'], sender_email))
                 msg['To'] = s_email
+                msg['Cc'] = admin_email
                 
                 if smtp_port == 465:
                     with smtplib.SMTP_SSL(smtp_server, smtp_port) as server:
                         server.login(sender_email, sender_password)
-                        server.send_message(msg)
+                        server.send_message(msg, to_addrs=recipients)
                 else:
                     with smtplib.SMTP(smtp_server, smtp_port) as server:
                         server.starttls()
                         server.login(sender_email, sender_password)
-                        server.send_message(msg)
+                        server.send_message(msg, to_addrs=recipients)
                 st.success("登録完了メールを送信しました。")
             except Exception as e:
                  st.warning(f"登録しましたがメール送信に失敗: {e}")
@@ -378,23 +363,19 @@ def page_admin():
         
     st.success("認証成功")
     
-    # 現在の設定を取得（ラベル名などをUIに反映するため）
     settings = get_app_settings()
-    label_a = settings['label_a'] # 例: 参加会場
-    label_b = settings['label_b'] # 例: 出場部門
+    label_a = settings['label_a']
+    label_b = settings['label_b']
 
-    # タブ名を動的に設定
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         f"{label_a}設定", 
         f"{label_b}設定", 
         "入力項目", "スタッフ", "データ", "全体設定"
     ])
     
-    # --- Tab 1: セレクターA（旧会場）設定 ---
+    # Tab 1: セレクターA設定
     with tab1:
         st.subheader(f"{label_a} の管理 (通知連携あり)")
-        st.caption(f"※ここはメール通知先と紐づく項目です。")
-        
         with st.expander("➕ 新規追加"):
             with st.form("add_a"):
                 v_name = st.text_input("名称")
@@ -428,10 +409,9 @@ def page_admin():
                         clear_all_cache()
                         st.rerun()
 
-    # --- Tab 2: セレクターB（旧部門）設定 ---
+    # Tab 2: セレクターB設定
     with tab2:
         st.subheader(f"{label_b} の管理 (データのみ)")
-        st.caption("※ここは単なる分類データです。")
         with st.expander("➕ 新規追加"):
             with st.form("add_b"):
                 d_name = st.text_input("名称")
@@ -452,11 +432,9 @@ def page_admin():
                     clear_all_cache()
                     st.rerun()
 
-    # --- Tab 3: 入力項目 ---
+    # Tab 3: 入力項目
     with tab3:
         st.subheader("追加質問項目")
-        st.caption(f"条件欄に「{label_b}」の名称を入れると、その時だけ表示されます。")
-        # （追加・削除ロジックは以前と同じため省略なしで実装）
         with st.expander("➕ 追加"):
             with st.form("add_item"):
                 i_label = st.text_input("質問ラベル")
@@ -482,36 +460,46 @@ def page_admin():
                     clear_all_cache()
                     st.rerun()
 
-    # --- Tab 4: スタッフ ---
+    # Tab 4: スタッフ管理 (機能改善箇所)
     with tab4:
         st.subheader("スタッフ管理")
-        st.caption(f"各スタッフは「{label_a}」に紐づきます。")
+        st.caption(f"各スタッフの紐づき状況: {label_a}")
+        
         staffs = tbl_staff.all()
+        
+        h1, h2, h3, h4 = st.columns([2, 2, 3, 1])
+        h1.markdown(f"**担当{label_a}**")
+        h2.markdown("**氏名**")
+        h3.markdown("**メール**")
+        
         for s in staffs:
-            c1, c2, c3 = st.columns([2, 3, 1])
-            c1.write(s['fields'].get('Name'))
-            c2.write(s['fields'].get('Email'))
-            if c3.button("削除", key=s['id']):
+            c1, c2, c3, c4 = st.columns([2, 2, 3, 1])
+            assigned_venue = s['fields'].get('Assigned_Venue', '(未設定)')
+            
+            c1.write(assigned_venue)
+            c2.write(s['fields'].get('Name'))
+            c3.write(s['fields'].get('Email'))
+            
+            if c4.button("削除", key=s['id']):
                 tbl_staff.delete(s['id'])
                 st.rerun()
 
-    # --- Tab 5: データ ---
+    # Tab 5: データ管理
     with tab5:
         st.subheader("データ管理")
         subs = tbl_submissions.all()
         df = pd.DataFrame([s['fields'] for s in subs])
         st.write(f"件数: {len(df)}")
         if not df.empty:
-            csv = df.to_csv(index=False).encode('utf-8')
-            st.download_button("CSV DL", csv, "data.csv", "text/csv")
+            # BOM付きUTF-8で文字化け防止
+            csv = df.to_csv(index=False).encode('utf-8-sig')
+            st.download_button("CSV DL (Excel対応版)", csv, "data.csv", "text/csv")
 
-    # --- Tab 6: 全体設定（ここが重要） ---
+    # Tab 6: 全体設定
     with tab6:
         st.subheader("全体設定・名称変更")
-        
         with st.form("global_config"):
             st.markdown("##### 🏷️ 表示名と表示ON/OFF")
-            
             col_a1, col_a2 = st.columns([3, 1])
             new_label_a = col_a1.text_input("セレクター①の名称（メール紐づけあり）", value=settings['label_a'])
             new_vis_a = col_a2.checkbox("①を表示する", value=settings['vis_a'])
@@ -523,7 +511,7 @@ def page_admin():
             st.divider()
             st.markdown("##### 🔐 認証・その他")
             new_title = st.text_input("画面タイトル", value=settings['page_title'])
-            new_pass = st.text_input("管理者パスワード", value="*****") # セキュリティ上伏せ字推奨だが簡易実装
+            new_pass = st.text_input("管理者パスワード", value="*****") 
             new_staff_pass = st.text_input("スタッフ登録パスワード")
             new_email = st.text_input("管理者メール")
 
@@ -534,7 +522,6 @@ def page_admin():
                 update_config_value('visible_selector_b', new_vis_b)
                 update_config_value('page_title', new_title)
                 
-                # パスワード系は入力があった場合のみ更新（空なら変更なし）
                 if new_pass != "*****" and new_pass: update_config_value('admin_password', new_pass)
                 if new_staff_pass: update_config_value('staff_password', new_staff_pass)
                 if new_email: update_config_value('admin_email', new_email)
