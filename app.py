@@ -4,7 +4,7 @@ from pyairtable import Api
 from datetime import datetime
 import time
 import smtplib
-import json  # 追加: 条件保存用
+import json
 from email.mime.text import MIMEText
 from email.utils import formataddr
 
@@ -494,7 +494,7 @@ def page_admin():
                 time.sleep(1)
                 st.rerun()
 
-    # Tab 3: 入力項目 (条件設定の高度化)
+    # Tab 3: 入力項目 (編集機能の追加)
     with tab3:
         st.subheader("追加質問項目")
         
@@ -504,6 +504,7 @@ def page_admin():
         opts_list_a = [o['fields'].get('Name') for o in opt_data_a if o['fields'].get('Name')]
         opts_list_b = [o['fields'].get('Name') for o in opt_data_b if o['fields'].get('Name')]
 
+        # --- 新規追加フォーム ---
         with st.expander("➕ 新規追加"):
             with st.form("add_item"):
                 i_label = st.text_input("質問ラベル")
@@ -520,55 +521,101 @@ def page_admin():
                 i_order = st.number_input("順序", value=1)
                 
                 if st.form_submit_button("追加") and i_label:
-                    # 条件をJSON形式で保存
                     cond_dict = {}
                     if cond_venues: cond_dict['venues'] = cond_venues
                     if cond_depts: cond_dict['depts'] = cond_depts
                     
-                    # 空なら空文字保存、値があればJSON文字列化
                     i_cond_str = json.dumps(cond_dict, ensure_ascii=False) if cond_dict else ""
                     
                     tbl_form_items.create({
                         "Label": i_label, 
                         "Type": i_type, 
                         "Options": i_options, 
-                        "Condition": i_cond_str, # JSON保存
+                        "Condition": i_cond_str, 
                         "Order": i_order, 
                         "Active": True
                     })
                     clear_all_cache()
                     st.rerun()
         
+        st.divider()
+
+        # --- 既存項目の表示・編集 ---
         items = get_active_form_items()
+        item_types = ["text", "textarea", "select", "checkbox"]
+        
         for item in items:
             f = item['fields']
             item_id = item['id']
             
-            with st.container(border=True):
-                c1, c2, c3 = st.columns([1, 4, 1])
-                c1.write(f"#{f.get('Order')}")
-                
-                # 条件の表示用文字列作成
-                cond_str_display = ""
-                raw_cond = f.get('Condition')
-                if raw_cond:
+            # リスト表示ではなく、Expanderにして編集可能にする
+            with st.expander(f"#{f.get('Order')} {f.get('Label')} [{f.get('Type')}]"):
+                with st.form(key=f"edit_item_{item_id}"):
+                    # 1. 基本情報
+                    e_label = st.text_input("質問ラベル", value=f.get('Label'), key=f"el_{item_id}")
+                    
+                    # タイプ選択の初期値index計算
+                    curr_type = f.get('Type', 'text')
                     try:
-                        c_data = json.loads(raw_cond)
-                        v_list = c_data.get('venues', [])
-                        d_list = c_data.get('depts', [])
-                        if v_list: cond_str_display += f"[{label_a}:{','.join(v_list)}] "
-                        if d_list: cond_str_display += f"[{label_b}:{','.join(d_list)}]"
-                    except:
-                        cond_str_display = f"(旧形式: {raw_cond})"
-                
-                c2.write(f"**{f.get('Label')}** [{f.get('Type')}]")
-                if cond_str_display:
-                    c2.caption(f"条件: {cond_str_display}")
-                
-                if c3.button("削除", key=f"del_item_{item_id}"):
-                    tbl_form_items.delete(item_id)
-                    clear_all_cache()
-                    st.rerun()
+                        type_idx = item_types.index(curr_type)
+                    except ValueError:
+                        type_idx = 0
+                    e_type = st.selectbox("タイプ", item_types, index=type_idx, key=f"et_{item_id}")
+                    
+                    e_options = st.text_input("選択肢(select用)", value=f.get('Options', ''), key=f"eo_{item_id}")
+                    e_order = st.number_input("順序", value=f.get('Order', 1), key=f"eord_{item_id}")
+                    
+                    st.markdown("---")
+                    st.write("**表示条件の編集**")
+                    
+                    # 2. 条件のパースと初期値設定
+                    raw_cond = f.get('Condition')
+                    default_v = []
+                    default_d = []
+                    if raw_cond:
+                        try:
+                            # JSON形式の場合
+                            c_data = json.loads(raw_cond)
+                            default_v = c_data.get('venues', [])
+                            default_d = c_data.get('depts', [])
+                        except:
+                            # 旧形式(csv)の場合: 部門として扱う
+                            default_d = [x.strip() for x in raw_cond.split(',')]
+                    
+                    # 選択肢リストに含まれていない値がdefaultにあるとエラーになるためフィルタリング
+                    valid_def_v = [v for v in default_v if v in opts_list_a]
+                    valid_def_d = [d for d in default_d if d in opts_list_b]
+
+                    e_cond_v = st.multiselect(f"対象の{label_a}", opts_list_a, default=valid_def_v, key=f"ecv_{item_id}")
+                    e_cond_d = st.multiselect(f"対象の{label_b}", opts_list_b, default=valid_def_d, key=f"ecd_{item_id}")
+                    
+                    # 3. ボタンエリア
+                    col_update, col_delete = st.columns([1, 1])
+                    
+                    if col_update.form_submit_button("更新"):
+                        # 条件の再構築
+                        new_cond_dict = {}
+                        if e_cond_v: new_cond_dict['venues'] = e_cond_v
+                        if e_cond_d: new_cond_dict['depts'] = e_cond_d
+                        
+                        new_cond_str = json.dumps(new_cond_dict, ensure_ascii=False) if new_cond_dict else ""
+                        
+                        tbl_form_items.update(item_id, {
+                            "Label": e_label,
+                            "Type": e_type,
+                            "Options": e_options,
+                            "Condition": new_cond_str,
+                            "Order": e_order
+                        })
+                        clear_all_cache()
+                        st.success("更新しました")
+                        time.sleep(1)
+                        st.rerun()
+
+                    if col_delete.form_submit_button("削除", type="primary"):
+                        tbl_form_items.delete(item_id)
+                        clear_all_cache()
+                        st.rerun()
 
     # Tab 4: スタッフ管理
     with tab4:
