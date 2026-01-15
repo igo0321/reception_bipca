@@ -4,6 +4,7 @@ from pyairtable import Api
 from datetime import datetime
 import time
 import smtplib
+import json  # 追加: 条件保存用
 from email.mime.text import MIMEText
 from email.utils import formataddr
 
@@ -65,7 +66,6 @@ def delete_all_records(table_obj):
     """指定テーブルの全レコードを削除する（バッチ処理）"""
     all_records = table_obj.all()
     all_ids = [r['id'] for r in all_records]
-    # 10件ずつバッチ削除（pyairtableのbatch_deleteは自動でチャンク処理してくれるが念のため）
     if all_ids:
         table_obj.batch_delete(all_ids)
 
@@ -115,7 +115,7 @@ def send_notification_email(settings, val_a, val_b, name, phone, details_text):
         sender_email = st.secrets["mail"]["sender_email"]
         sender_password = st.secrets["mail"]["sender_password"]
     except Exception:
-        st.error("メールサーバー設定が見つかりません。")
+        # メール設定がない場合はスキップ
         return False
 
     admin_email = settings['admin_email']
@@ -238,13 +238,42 @@ def page_participant():
         custom_responses = {}
         for item in form_items:
             f = item['fields']
-            condition = f.get('Condition')
+            condition_str = f.get('Condition')
             
-            if condition:
-                if not selected_val_b: continue
-                cond_list = [c.strip() for c in condition.replace('、', ',').split(',')]
-                if selected_val_b not in cond_list: continue 
+            # --- 表示条件判定 (JSON対応版) ---
+            show_item = True
+            
+            if condition_str:
+                try:
+                    # JSONとしてパースを試みる
+                    cond_data = json.loads(condition_str)
+                    target_venues = cond_data.get('venues', [])
+                    target_depts = cond_data.get('depts', [])
+                    
+                    # セレクター①(Venue)条件チェック
+                    if target_venues:
+                        if not selected_val_a or selected_val_a not in target_venues:
+                            show_item = False
+                            
+                    # セレクター②(Dept)条件チェック
+                    if target_depts:
+                        if not selected_val_b or selected_val_b not in target_depts:
+                            show_item = False
+                            
+                except json.JSONDecodeError:
+                    # JSONでない場合は旧仕様（カンマ区切りテキスト＝部門指定とみなす）
+                    if selected_val_b:
+                        cond_list = [c.strip() for c in condition_str.replace('、', ',').split(',')]
+                        if selected_val_b not in cond_list:
+                            show_item = False
+                    else:
+                        # 部門未選択なら表示しない（旧仕様に準拠）
+                        show_item = False
+            
+            if not show_item:
+                continue
 
+            # --- 項目描画 ---
             label = f.get('Label', '無題の質問')
             q_type = f.get('Type', 'text')
             options_str = f.get('Options', '')
@@ -386,26 +415,38 @@ def page_admin():
     # Tab 1: セレクターA設定
     with tab1:
         st.subheader(f"{label_a} の管理 (通知連携あり)")
-        with st.expander("➕ 新規追加"):
+        
+        # --- 自動連番の計算 ---
+        data_a = get_selector_a_options()
+        current_orders = [x['fields'].get('Order', 0) for x in data_a]
+        next_order = max(current_orders) + 1 if current_orders else 1
+        
+        with st.expander("➕ 新規追加", expanded=True):
             with st.form("add_a"):
                 v_name = st.text_input("名称")
                 v_msg = st.text_area("完了時メッセージ")
-                v_order = st.number_input("表示順", value=1)
+                # ここで計算した next_order を初期値にする
+                v_order = st.number_input("表示順", value=next_order, step=1)
+                
                 if st.form_submit_button("追加") and v_name:
                     tbl_venues.create({"Name": v_name, "Message": v_msg, "Order": v_order, "Active": True})
                     clear_all_cache()
                     st.rerun()
+                    
         st.divider()
-        data_a = get_selector_a_options()
+        
+        # --- 編集リスト ---
         for v in data_a:
             title = f"{v['fields'].get('Name')}"
             if not v['fields'].get('Active', True): title += " 【非公開】"
+            
             with st.expander(title, expanded=False):
-                with st.form(f"edit_a_{v['id']}"):
-                    new_name = st.text_input("名称", value=v['fields'].get('Name'))
-                    new_msg = st.text_area("完了時メッセージ", value=v['fields'].get('Message', ''), height=100)
-                    new_order = st.number_input("表示順", value=v['fields'].get('Order', 999))
-                    is_active = st.checkbox("有効", value=v['fields'].get('Active', True))
+                # Unique key を付与して挙動を安定させる
+                with st.form(f"edit_a_form_{v['id']}"):
+                    new_name = st.text_input("名称", value=v['fields'].get('Name'), key=f"name_{v['id']}")
+                    new_msg = st.text_area("完了時メッセージ", value=v['fields'].get('Message', ''), height=100, key=f"msg_{v['id']}")
+                    new_order = st.number_input("表示順", value=v['fields'].get('Order', 999), key=f"ord_{v['id']}")
+                    is_active = st.checkbox("有効", value=v['fields'].get('Active', True), key=f"act_{v['id']}")
                     
                     c1, c2 = st.columns(2)
                     if c1.form_submit_button("更新"):
@@ -414,79 +455,118 @@ def page_admin():
                         st.success("更新しました")
                         time.sleep(1)
                         st.rerun()
+                        
+                    # 削除ボタンは誤操作防止のため赤色に
                     if c2.form_submit_button("削除", type="primary"):
                         tbl_venues.delete(v['id'])
                         clear_all_cache()
                         st.rerun()
 
-    # Tab 2: セレクターB設定 (一括編集機能へ変更)
+    # Tab 2: セレクターB設定 (一括編集機能)
     with tab2:
         st.subheader(f"{label_b} の管理 (データのみ)")
         st.info("※テキストエリアで一括編集・並び替えができます。上から順に表示されます。")
         
-        # 現在のデータを取得
-        current_data = get_selector_b_options()
-        current_names = [d['fields'].get('Name') for d in current_data if d['fields'].get('Name')]
-        
-        # テキストエリア用文字列作成
-        default_text = "\n".join(current_names)
+        current_data_b = get_selector_b_options()
+        current_names_b = [d['fields'].get('Name') for d in current_data_b if d['fields'].get('Name')]
+        default_text_b = "\n".join(current_names_b)
         
         with st.form("batch_edit_b"):
-            updated_text = st.text_area(
+            updated_text_b = st.text_area(
                 "項目一覧（1行1項目）",
-                value=default_text,
+                value=default_text_b,
                 height=300,
                 help="項目を追加、削除、並び替えする場合はここで編集して保存してください。"
             )
             
             if st.form_submit_button("保存して更新する"):
-                # 入力テキストをリスト化（空行除去）
-                new_names = [line.strip() for line in updated_text.split('\n') if line.strip()]
-                
+                new_names_b = [line.strip() for line in updated_text_b.split('\n') if line.strip()]
                 with st.spinner("更新中..."):
-                    # 1. 既存データを全削除（IDが変わるがデータ用項目なので許容）
-                    old_ids = [d['id'] for d in current_data]
-                    if old_ids:
-                        tbl_departments.batch_delete(old_ids)
+                    old_ids_b = [d['id'] for d in current_data_b]
+                    if old_ids_b:
+                        tbl_departments.batch_delete(old_ids_b)
                     
-                    # 2. 新しい順序で作成
-                    records_to_create = []
-                    for i, name in enumerate(new_names):
-                        # pyairtableのbatch_create用に辞書を作成してもよいが、単純なループで作成
-                        # (件数が数百件でなければcreate連打でも許容範囲だが、念のためbatch推奨だがここではシンプルにcreate)
+                    for i, name in enumerate(new_names_b):
                         tbl_departments.create({"Name": name, "Order": i + 1, "Active": True})
                     
                     clear_all_cache()
-                
-                st.success(f"{len(new_names)}件の項目を更新しました。")
+                st.success(f"{len(new_names_b)}件の項目を更新しました。")
                 time.sleep(1)
                 st.rerun()
 
-    # Tab 3: 入力項目
+    # Tab 3: 入力項目 (条件設定の高度化)
     with tab3:
         st.subheader("追加質問項目")
-        with st.expander("➕ 追加"):
+        
+        # 選択肢データの取得（セレクトボックス用）
+        opt_data_a = get_selector_a_options()
+        opt_data_b = get_selector_b_options()
+        opts_list_a = [o['fields'].get('Name') for o in opt_data_a if o['fields'].get('Name')]
+        opts_list_b = [o['fields'].get('Name') for o in opt_data_b if o['fields'].get('Name')]
+
+        with st.expander("➕ 新規追加"):
             with st.form("add_item"):
                 i_label = st.text_input("質問ラベル")
                 i_type = st.selectbox("タイプ", ["text", "textarea", "select", "checkbox"])
-                i_options = st.text_input("選択肢(select用)")
-                i_cond = st.text_input(f"表示条件({label_b}名)")
+                i_options = st.text_input("選択肢(select用, カンマ区切り)")
+                
+                st.markdown("---")
+                st.markdown("**表示条件設定**（何も選択しない場合は「全員」に表示）")
+                
+                # --- 条件入力 (Multi-Select) ---
+                cond_venues = st.multiselect(f"対象の{label_a}", opts_list_a)
+                cond_depts = st.multiselect(f"対象の{label_b}", opts_list_b)
+                
                 i_order = st.number_input("順序", value=1)
+                
                 if st.form_submit_button("追加") and i_label:
-                    tbl_form_items.create({"Label": i_label, "Type": i_type, "Options": i_options, "Condition": i_cond, "Order": i_order, "Active": True})
+                    # 条件をJSON形式で保存
+                    cond_dict = {}
+                    if cond_venues: cond_dict['venues'] = cond_venues
+                    if cond_depts: cond_dict['depts'] = cond_depts
+                    
+                    # 空なら空文字保存、値があればJSON文字列化
+                    i_cond_str = json.dumps(cond_dict, ensure_ascii=False) if cond_dict else ""
+                    
+                    tbl_form_items.create({
+                        "Label": i_label, 
+                        "Type": i_type, 
+                        "Options": i_options, 
+                        "Condition": i_cond_str, # JSON保存
+                        "Order": i_order, 
+                        "Active": True
+                    })
                     clear_all_cache()
                     st.rerun()
         
         items = get_active_form_items()
         for item in items:
             f = item['fields']
+            item_id = item['id']
+            
             with st.container(border=True):
                 c1, c2, c3 = st.columns([1, 4, 1])
                 c1.write(f"#{f.get('Order')}")
-                cond = f" (条件: {f.get('Condition')})" if f.get('Condition') else ""
-                c2.write(f"**{f.get('Label')}** [{f.get('Type')}]{cond}")
-                if c3.button("削除", key=item['id']):
-                    tbl_form_items.delete(item['id'])
+                
+                # 条件の表示用文字列作成
+                cond_str_display = ""
+                raw_cond = f.get('Condition')
+                if raw_cond:
+                    try:
+                        c_data = json.loads(raw_cond)
+                        v_list = c_data.get('venues', [])
+                        d_list = c_data.get('depts', [])
+                        if v_list: cond_str_display += f"[{label_a}:{','.join(v_list)}] "
+                        if d_list: cond_str_display += f"[{label_b}:{','.join(d_list)}]"
+                    except:
+                        cond_str_display = f"(旧形式: {raw_cond})"
+                
+                c2.write(f"**{f.get('Label')}** [{f.get('Type')}]")
+                if cond_str_display:
+                    c2.caption(f"条件: {cond_str_display}")
+                
+                if c3.button("削除", key=f"del_item_{item_id}"):
+                    tbl_form_items.delete(item_id)
                     clear_all_cache()
                     st.rerun()
 
@@ -584,12 +664,9 @@ def page_admin():
                         delete_all_records(tbl_config)
                         
                         # 4. 指定パスワードで設定を再作成
-                        # （Configを全消去したため、パスワードレコードを新規作成します）
                         reset_pw = "iqqoo32i"
                         tbl_config.create({"Key": "admin_password", "Value": reset_pw})
                         tbl_config.create({"Key": "staff_password", "Value": reset_pw})
-                        
-                        # ※その他の設定（タイトル等）はレコードがなければデフォルト値が使われます
                         
                         clear_all_cache()
                         
