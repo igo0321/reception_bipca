@@ -106,6 +106,7 @@ def update_config_value(key, new_value):
     else:
         tbl_config.create({"Key": key, "Value": str(new_value)})
 
+@st.cache_data(ttl=600, show_spinner=False)
 def get_app_settings():
     """アプリ全体の表示設定を一括取得"""
     settings = {}
@@ -611,3 +612,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
